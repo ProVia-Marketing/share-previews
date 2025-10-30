@@ -59,6 +59,8 @@ WordPress will automatically load the `.php` file from the root of `/wp-content/
 
 ### For End Users (Content Editors)
 
+#### Creating Preview URLs from Post Editor
+
 1. Create a new draft post or page
 2. In the WordPress editor sidebar, find the **Preview URL** meta box
 3. Click **+ Generate Preview URL** to create a secure preview link
@@ -66,6 +68,37 @@ WordPress will automatically load the `.php` file from the root of `/wp-content/
 5. Share the URL with anyone who should review the draft
 6. Use **🔄 Regenerate URL** to create a new URL (invalidates the old one)
 7. Use **🗑️ Remove URL** to deactivate the preview link
+
+#### Managing Preview URLs from Admin Dashboard
+
+Administrators can manage all active preview URLs from a centralized dashboard:
+
+1. Go to **Tools → Share Previews** in the WordPress admin
+2. View all posts with active preview URLs
+3. **Search** by post title
+4. **Filter** by post type (Posts, Pages)
+5. **Bulk Actions:**
+   - 📋 **Copy** – Copy the preview URL to clipboard
+   - 👁️ **View** – Open the preview in a new window
+   - 🔄 **Regen** – Regenerate the preview URL (invalidates the old one)
+   - 🗑️ **Delete** – Remove the preview URL
+
+#### Admin Dashboard Features
+
+The **Share Previews Manager** provides a centralized hub for managing all active preview URLs:
+
+- **Search** by post title to quickly find drafts
+- **Filter** by post type to focus on Posts or Pages
+- **View Post Details** – Post type, status, creation date
+- **Pagination** – Navigate through large lists of previews
+- **Quick Actions** – Copy, view, regenerate, or delete URLs inline
+- **Direct Editing** – Click post titles to edit in the WordPress editor
+
+This is useful for:
+- Security audits – See all active preview URLs at a glance
+- Bulk management – Regenerate or remove multiple URLs
+- Troubleshooting – Find and copy preview URLs for specific posts
+- Admin oversight – Monitor which drafts have active previews
 
 ### For Developers
 

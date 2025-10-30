@@ -734,3 +734,421 @@ add_action('wp_ajax_share_previews_remove_key', function () {
     ]);
 });
 
+/**
+ * Register the Share Previews admin page.
+ */
+add_action('admin_menu', function () {
+    add_submenu_page(
+        'tools.php',
+        'Share Previews',
+        'Share Previews',
+        'manage_options',
+        'share-previews-manager',
+        'share_previews_render_admin_page'
+    );
+});
+
+/**
+ * Render the Share Previews admin page.
+ */
+function share_previews_render_admin_page() {
+    if (!current_user_can('manage_options')) {
+        wp_die('Unauthorized');
+    }
+
+    // Get search/filter parameters
+    $search = isset($_GET['s']) ? sanitize_text_field($_GET['s']) : '';
+    $post_type = isset($_GET['post_type']) ? sanitize_text_field($_GET['post_type']) : '';
+    $paged = isset($_GET['paged']) ? max(1, intval($_GET['paged'])) : 1;
+    $per_page = 20;
+
+    // Query posts with preview keys
+    $args = [
+        'post_type' => ['post', 'page'],
+        'posts_per_page' => $per_page,
+        'paged' => $paged,
+        'meta_key' => '_share_previews_key',
+        'orderby' => 'modified',
+        'order' => 'DESC',
+    ];
+
+    // Add search parameter
+    if (!empty($search)) {
+        $args['s'] = $search;
+    }
+
+    // Add post type filter
+    if (!empty($post_type)) {
+        $args['post_type'] = $post_type;
+    }
+
+    $query = new WP_Query($args);
+    $total_pages = $query->max_num_pages;
+
+    ?>
+    <div class="wrap">
+        <h1>Share Previews Manager</h1>
+        <p>Manage all active preview URLs for draft posts and pages.</p>
+
+        <!-- Search and Filter -->
+        <form method="get" class="share-previews-search-form">
+            <input type="hidden" name="page" value="share-previews-manager">
+            <input 
+                type="text" 
+                name="s" 
+                placeholder="Search by post title..." 
+                value="<?php echo esc_attr($search); ?>"
+                class="regular-text"
+            >
+            <select name="post_type" class="postform">
+                <option value="">All Post Types</option>
+                <option value="post" <?php selected($post_type, 'post'); ?>>Posts</option>
+                <option value="page" <?php selected($post_type, 'page'); ?>>Pages</option>
+            </select>
+            <input type="submit" value="Filter" class="button">
+            <a href="?page=share-previews-manager" class="button">Reset</a>
+        </form>
+
+        <style>
+            .share-previews-search-form {
+                margin: 20px 0;
+                display: flex;
+                gap: 10px;
+                align-items: center;
+                flex-wrap: wrap;
+            }
+
+            .share-previews-table {
+                width: 100%;
+                border-collapse: collapse;
+                background: white;
+                box-shadow: 0 1px 1px rgba(0,0,0,0.04);
+                margin-top: 20px;
+            }
+
+            .share-previews-table thead {
+                background: #f5f5f5;
+                border-bottom: 1px solid #ddd;
+            }
+
+            .share-previews-table th {
+                padding: 12px;
+                text-align: left;
+                font-weight: 600;
+                font-size: 13px;
+                color: #333;
+            }
+
+            .share-previews-table td {
+                padding: 12px;
+                border-bottom: 1px solid #eee;
+                font-size: 13px;
+            }
+
+            .share-previews-table tbody tr:hover {
+                background: #fafafa;
+            }
+
+            .share-previews-url-cell {
+                font-family: monospace;
+                word-break: break-all;
+                max-width: 300px;
+                color: #0073aa;
+            }
+
+            .share-previews-actions {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+
+            .share-previews-btn {
+                padding: 4px 8px;
+                font-size: 12px;
+                text-decoration: none;
+                border: none;
+                border-radius: 3px;
+                cursor: pointer;
+                transition: background 150ms ease-in-out;
+            }
+
+            .share-previews-btn-copy {
+                background: #0073aa;
+                color: white;
+            }
+
+            .share-previews-btn-copy:hover {
+                background: #005a87;
+            }
+
+            .share-previews-btn-regen {
+                background: #dc3545;
+                color: white;
+            }
+
+            .share-previews-btn-regen:hover {
+                background: #c82333;
+            }
+
+            .share-previews-btn-delete {
+                background: transparent;
+                color: #666;
+                border: none;
+            }
+
+            .share-previews-btn-delete:hover {
+                color: #333;
+            }
+
+            .share-previews-btn-view {
+                background: #28a745;
+                color: white;
+            }
+
+            .share-previews-btn-view:hover {
+                background: #218838;
+                color: white;
+            }
+
+            .share-previews-empty {
+                padding: 30px;
+                text-align: center;
+                color: #666;
+                background: #f9f9f9;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                margin-top: 20px;
+            }
+
+            .share-previews-pagination {
+                margin-top: 20px;
+            }
+
+            .share-previews-post-title a {
+                color: #0073aa;
+                text-decoration: none;
+            }
+
+            .share-previews-post-title a:hover {
+                text-decoration: underline;
+            }
+
+            .share-previews-post-type {
+                display: inline-block;
+                padding: 2px 6px;
+                background: #e7f3ff;
+                border-radius: 3px;
+                font-size: 11px;
+                color: #0073aa;
+                margin-left: 8px;
+            }
+
+            .share-previews-status {
+                font-size: 12px;
+                color: #666;
+            }
+        </style>
+
+        <!-- Posts Table -->
+        <?php if ($query->have_posts()) : ?>
+            <table class="share-previews-table">
+                <thead>
+                    <tr>
+                        <th style="width: 25%;">Post</th>
+                        <th style="width: 40%;">Preview URL</th>
+                        <th style="width: 15%;">Created</th>
+                        <th style="width: 20%;">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php while ($query->have_posts()) : $query->the_post(); 
+                        $post_id = get_the_ID();
+                        $preview_url = share_previews_get_draft_preview_link($post_id);
+                        $created = get_post_meta($post_id, '_share_previews_key_created', true);
+                        if (!$created) {
+                            $created = get_the_modified_date('U', $post_id);
+                        }
+                    ?>
+                        <tr>
+                            <td class="share-previews-post-title">
+                                <a href="<?php echo get_edit_post_link($post_id); ?>" target="_blank">
+                                    <?php echo esc_html(get_the_title() ?: '(Untitled)'); ?>
+                                </a>
+                                <span class="share-previews-post-type"><?php echo esc_html(get_post_type()); ?></span>
+                                <div class="share-previews-status">
+                                    Status: <strong><?php echo esc_html(get_post_status()); ?></strong>
+                                </div>
+                            </td>
+                            <td class="share-previews-url-cell">
+                                <?php if ($preview_url) : ?>
+                                    <code><?php echo esc_html($preview_url); ?></code>
+                                <?php else : ?>
+                                    <em style="color: #999;">Unable to generate URL</em>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?php echo esc_html(wp_date('M j, Y', $created)); ?>
+                            </td>
+                            <td>
+                                <div class="share-previews-actions">
+                                    <?php if ($preview_url) : ?>
+                                        <button 
+                                            class="share-previews-btn share-previews-btn-copy" 
+                                            onclick="share_previews_copy_admin_url('<?php echo esc_attr($preview_url); ?>', this)"
+                                        >
+                                            📋 Copy
+                                        </button>
+                                        <a 
+                                            href="<?php echo esc_url($preview_url); ?>" 
+                                            target="_blank" 
+                                            class="share-previews-btn share-previews-btn-view"
+                                        >
+                                            👁️ View
+                                        </a>
+                                        <button 
+                                            class="share-previews-btn share-previews-btn-regen" 
+                                            onclick="share_previews_admin_regenerate(<?php echo $post_id; ?>, this)"
+                                        >
+                                            🔄 Regen
+                                        </button>
+                                        <button 
+                                            class="share-previews-btn share-previews-btn-delete" 
+                                            onclick="share_previews_admin_delete(<?php echo $post_id; ?>, '<?php echo esc_attr(get_the_title()); ?>', this)"
+                                        >
+                                            🗑️ Delete
+                                        </button>
+                                    <?php endif; ?>
+                                </div>
+                            </td>
+                        </tr>
+                    <?php endwhile; ?>
+                </tbody>
+            </table>
+
+            <!-- Pagination -->
+            <?php if ($total_pages > 1) : ?>
+                <div class="share-previews-pagination">
+                    <?php
+                    $base_url = add_query_arg(['page' => 'share-previews-manager', 's' => $search, 'post_type' => $post_type]);
+                    $args = [
+                        'base' => $base_url . '&paged=%#%',
+                        'format' => '',
+                        'prev_text' => '← Previous',
+                        'next_text' => 'Next →',
+                        'total' => $total_pages,
+                        'current' => $paged,
+                    ];
+                    echo paginate_links($args);
+                    ?>
+                </div>
+            <?php endif; ?>
+
+            <?php wp_reset_postdata(); ?>
+
+        <?php else : ?>
+            <div class="share-previews-empty">
+                <p>No preview URLs found. Create a draft post or page and generate a preview URL to see it here.</p>
+            </div>
+        <?php endif; ?>
+    </div>
+
+    <script>
+        function share_previews_copy_admin_url(url, button) {
+            const textarea = document.createElement('textarea');
+            textarea.value = url;
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textarea);
+
+            const originalText = button.textContent;
+            button.textContent = '✓ Copied!';
+            button.style.background = '#28a745';
+            
+            setTimeout(() => {
+                button.textContent = originalText;
+                button.style.background = '';
+            }, 2000);
+        }
+
+        function share_previews_admin_regenerate(postId, button) {
+            if (!confirm('Regenerate preview URL? The old URL will no longer work.')) {
+                return;
+            }
+
+            button.disabled = true;
+            button.textContent = '⏳ Regenerating...';
+
+            fetch(ajaxurl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: new URLSearchParams({
+                    action: 'share_previews_regenerate',
+                    post_id: postId,
+                    nonce: '<?php echo wp_create_nonce('share_previews_regen'); ?>'
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    location.reload();
+                } else {
+                    alert('Error: ' + (data.data || 'Unable to regenerate URL'));
+                    button.disabled = false;
+                    button.textContent = '🔄 Regen';
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('Error regenerating URL');
+                button.disabled = false;
+                button.textContent = '🔄 Regen';
+            });
+        }
+
+        function share_previews_admin_delete(postId, postTitle, button) {
+            if (!confirm('Delete preview URL for "' + postTitle + '"?\n\nThis cannot be undone.')) {
+                return;
+            }
+
+            button.disabled = true;
+            button.textContent = '⏳ Deleting...';
+
+            fetch(ajaxurl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: new URLSearchParams({
+                    action: 'share_previews_remove_key',
+                    post_id: postId,
+                    nonce: '<?php echo wp_create_nonce('share_previews_regen'); ?>'
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    const row = button.closest('tr');
+                    row.style.opacity = '0.5';
+                    setTimeout(() => {
+                        location.reload();
+                    }, 300);
+                } else {
+                    alert('Error: ' + (data.data || 'Unable to delete URL'));
+                    button.disabled = false;
+                    button.textContent = '🗑️ Delete';
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('Error deleting URL');
+                button.disabled = false;
+                button.textContent = '🗑️ Delete';
+            });
+        }
+    </script>
+    <?php
+}
+
