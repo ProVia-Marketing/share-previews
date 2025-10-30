@@ -26,13 +26,32 @@ Share Previews allows content editors to generate secure, time-limited preview U
 
 ## Installation
 
-This plugin is already installed as a must-use plugin (mu-plugin) and is automatically loaded by WordPress. No additional setup required.
+This plugin is installed as a must-use plugin (mu-plugin) and is automatically loaded by WordPress. No additional setup required.
 
 **Plugin Files:**
-- Main Plugin: `/wp-content/mu-plugins/share-previews/share-previews.php`
+- Symlink (WordPress loads this): `/wp-content/mu-plugins/share-previews.php` → points to `share-previews/share-previews.php`
+- Source Code: `/wp-content/mu-plugins/share-previews/share-previews.php`
 - Documentation: `/wp-content/mu-plugins/share-previews/README.md`
 
-Must-use plugins are automatically activated without needing to be enabled in the WordPress admin. WordPress loads all PHP files from the `/wp-content/mu-plugins/` directory (and subdirectories) on every page load.
+### Setup
+
+**Option 1: Using Symbolic Link**
+
+Create a symbolic link from the root of `/wp-content/mu-plugins/` to the plugin file:
+
+```bash
+cd /wp-content/mu-plugins
+ln -s share-previews/share-previews.php share-previews.php
+```
+
+**Option 2: Copying the File**
+
+1. Open [`share-previews.php`](./share-previews.php) in this repository
+2. Copy the entire contents
+3. Create a new file at `/wp-content/mu-plugins/share-previews.php`
+4. Paste the contents
+
+WordPress will automatically load the `.php` file from the root of `/wp-content/mu-plugins/`. Must-use plugins are activated without needing to be enabled in the WordPress admin.
 
 ---
 
