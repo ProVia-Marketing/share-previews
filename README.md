@@ -346,18 +346,64 @@ define('SHARE_PREVIEWS_TRUST_PROXY_HEADERS', true);
 ?>
 ```
 
+### Custom Base URL
+
+By default, preview URLs use your site's home URL. To specify a custom base URL (useful for staging environments with basic auth), add to `wp-config.php`:
+
+```php
+<?php
+define('SHARE_PREVIEWS_BASE_URL', 'https://your-staging-url.com/');
+?>
+```
+
+**With Basic Authentication:**
+
+If your website requires HTTP basic auth, include credentials in the URL:
+
+```php
+<?php
+define('SHARE_PREVIEWS_BASE_URL', 'https://username:password@your-staging-url.com/');
+?>
+```
+
+**Note:** Keep `wp-config.php` out of version control (add to `.gitignore`) to protect credentials. Both `wp-config.php` and environment variables offer equal security when properly managed.
+
+### Allow Preview URLs on All Post Statuses (Staging Mode)
+
+By default, preview URLs are only available for draft posts with unique keys. To enable a simplified staging mode where preview URLs work on all published posts without key management, add to `wp-config.php`:
+
+```php
+<?php
+define('SHARE_PREVIEWS_ALLOW_ALL_STATUSES', true);
+?>
+```
+
+When enabled:
+- Preview URLs only appear on **published/non-draft posts** (not drafts)
+- No key management required – simple URLs like `?p=123&preview=1`
+- Meta box shows the preview URL automatically, no key generation needed
+- Perfect for staging environments where published content is previewable
+- No regenerate or remove options – URLs cannot be deactivated
+- Combines well with `SHARE_PREVIEWS_BASE_URL` for staging with basic auth
+
+**Use Case:** On a staging environment with basic auth, enable this mode so anyone with staging access can preview published content without WordPress credentials or key management.
+
 ---
 
 ## Function Reference
 
 ### `share_previews_get_draft_preview_link( $post_id )`
 
-Generates a secure, shareable preview link for a draft post.
+Generates a secure, shareable preview link for a post.
+
+**Modes:**
+- **Draft Mode** (default) – Creates key-based preview URLs for draft posts only
+- **Staging Mode** (when `SHARE_PREVIEWS_ALLOW_ALL_STATUSES=true`) – Creates simple preview URLs for published/non-draft posts without keys
 
 **Parameters:**
-- `$post_id` (int) – The ID of the draft post
+- `$post_id` (int) – The ID of the post
 
-**Returns:** string|false – A fully qualified preview URL, or false if the post is not a draft or preview is not allowed
+**Returns:** string|false – A fully qualified preview URL, or false if the post doesn't meet the criteria for the current mode
 
 ### `share_previews_get_preview_key( $post_id )`
 

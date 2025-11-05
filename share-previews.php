@@ -16,37 +16,85 @@ if (!defined('ABSPATH')) {
     exit; // Exit if accessed directly
 }
 
-/**
- * Generate a secure, shareable preview link for a draft post.
- * Uses a unique key stored in post meta.
- *
- * @param int $post_id  The ID of the draft post.
- * @return string|false  A fully qualified preview URL, or false if post is not a draft.
- */
-function share_previews_get_draft_preview_link($post_id) {
+// Constants for meta keys
+define('SHARE_PREVIEWS_KEY_META', '_share_previews_key');
 
-    // Verify the post exists and is a draft
+/**
+ * Get the current preview mode setting
+ *
+ * @return bool  True if staging mode (all statuses), false if draft-only mode
+ */
+function share_previews_is_staging_mode() {
+    return defined('SHARE_PREVIEWS_ALLOW_ALL_STATUSES') && SHARE_PREVIEWS_ALLOW_ALL_STATUSES;
+}
+
+/**
+ * Get the base URL for preview links
+ *
+ * @return string  Base URL with trailing slash
+ */
+function share_previews_get_base_url() {
+    return defined('SHARE_PREVIEWS_BASE_URL') ? SHARE_PREVIEWS_BASE_URL : home_url('/');
+}
+
+/**
+ * Generate a secure, shareable preview link for a post.
+ * 
+ * Default mode (SHARE_PREVIEWS_ALLOW_ALL_STATUSES = false):
+ * - Works only on draft posts
+ * - Requires a unique key generated per post
+ * - Keys must be managed (generate/regenerate/remove)
+ * 
+ * Staging mode (SHARE_PREVIEWS_ALLOW_ALL_STATUSES = true):
+ * - Works only on published/non-draft posts
+ * - No key required - simple preview URLs
+ * - Perfect for staging environments with basic auth
+ * 
+ * Supports custom base URL via SHARE_PREVIEWS_BASE_URL constant in wp-config.php
+ * Example: define('SHARE_PREVIEWS_BASE_URL', 'https://user:pass@staging.example.com');
+ *
+ * @param int $post_id              The ID of the post.
+ * @param bool $auto_generate_key   Whether to auto-generate missing keys (default: true)
+ * @return string|false             A fully qualified preview URL, or false if post is not eligible.
+ */
+function share_previews_get_draft_preview_link($post_id, $auto_generate_key = true) {
     $post = get_post($post_id);
-    if (!$post || $post->post_status !== 'draft') {
+    if (!$post) {
         return false;
     }
 
+    $is_staging_mode = share_previews_is_staging_mode();
+    $base_url = share_previews_get_base_url();
+    
     // Apply filter to allow custom access control
     if (!apply_filters('share_previews_allow_preview', true, $post_id, $post)) {
         return false;
     }
 
-    // Get or generate the unique preview key
-    $key = share_previews_get_preview_key($post_id);
+    // Drafts: always use keys
+    if ($post->post_status === 'draft') {
+        $key = $auto_generate_key ? share_previews_get_preview_key($post_id) : share_previews_get_existing_preview_key($post_id);
+        
+        if (!$key) {
+            return false;
+        }
 
-    // Build the link
-    $url = add_query_arg([
-        'p' => $post_id,
-        'preview' => '1',
-        'key' => $key,
-    ], home_url('/'));
-
-    return $url;
+        return add_query_arg([
+            'p' => $post_id,
+            'preview' => '1',
+            'key' => $key,
+        ], $base_url);
+    }
+    
+    // Non-draft posts only work in staging mode
+    if ($is_staging_mode && $post->post_status === 'publish') {
+        return add_query_arg([
+            'p' => $post_id,
+            'preview' => '1',
+        ], $base_url);
+    }
+    
+    return false;
 }
 
 // Backwards compatibility alias (deprecated)
@@ -57,22 +105,32 @@ if (!function_exists('get_draft_preview_link')) {
 }
 
 /**
+ * Get a unique preview key for a post WITHOUT generating one if it doesn't exist.
+ *
+ * @param int $post_id  The post ID.
+ * @return string|false  The existing preview key, or false if none exists.
+ */
+function share_previews_get_existing_preview_key($post_id) {
+    $existing_key = get_post_meta($post_id, SHARE_PREVIEWS_KEY_META, true);
+    return !empty($existing_key) ? $existing_key : false;
+}
+
+/**
  * Get or generate a unique preview key for a post.
  *
  * @param int $post_id  The post ID.
- * @return string  A unique 64-character preview key.
+ * @return string       A unique 64-character preview key.
  */
 function share_previews_get_preview_key($post_id) {
-    // Check if key already exists
-    $existing_key = get_post_meta($post_id, '_share_previews_key', true);
+    $existing_key = share_previews_get_existing_preview_key($post_id);
     
-    if ($existing_key && !empty($existing_key)) {
+    if ($existing_key) {
         return $existing_key;
     }
 
-    // Generate a new unique key
     $new_key = bin2hex(random_bytes(32)); // 64-character hex string
-    update_post_meta($post_id, '_share_previews_key', $new_key);
+    update_post_meta($post_id, SHARE_PREVIEWS_KEY_META, $new_key);
+    update_post_meta($post_id, '_share_previews_key_created', time());
 
     return $new_key;
 }
@@ -81,11 +139,17 @@ function share_previews_get_preview_key($post_id) {
  * Regenerate a preview key for a post.
  *
  * @param int $post_id  The post ID.
- * @return string  The newly generated preview key.
+ * @return string       The newly generated preview key.
  */
 function share_previews_regenerate_preview_key($post_id) {
     $new_key = bin2hex(random_bytes(32));
-    update_post_meta($post_id, '_share_previews_key', $new_key);
+    update_post_meta($post_id, SHARE_PREVIEWS_KEY_META, $new_key);
+    update_post_meta($post_id, '_share_previews_key_created', time());
+    
+    // Clear the post meta cache to ensure immediate retrieval
+    wp_cache_delete($post_id, 'post_meta');
+    clean_post_cache($post_id);
+    
     share_previews_log_suspicious_activity('key_regenerated', $post_id, 'admin');
     return $new_key;
 }
@@ -104,38 +168,24 @@ function share_previews_is_valid_draft_preview_key() {
     }
 
     $post_id = intval($_GET['p']);
-    $key = sanitize_text_field($_GET['key']);
+    $raw_key = isset($_GET['key']) ? stripslashes($_GET['key']) : '';
+    $key = preg_replace('/[^a-f0-9]/i', '', $raw_key); // Only allow hex characters
 
-    // Validate post_id
-    if ($post_id <= 0) {
+    // Validate post_id and key length
+    if ($post_id <= 0 || strlen($key) !== 64) {
         return false;
     }
 
-    // Check rate limiting (max 10 attempts per minute per IP)
-    $ip = share_previews_get_client_ip();
-    $rate_limit_key = 'share_previews_attempts_' . md5($ip);
-    $attempts = (array) get_transient($rate_limit_key);
-    
-    if (count($attempts) >= 10) {
-        share_previews_log_suspicious_activity('rate_limit_exceeded', $post_id, $ip);
-        return false;
-    }
-
-    // Get the stored key from post meta
-    $stored_key = get_post_meta($post_id, '_share_previews_key', true);
+    // Get the stored key from post meta, bypassing cache
+    global $wpdb;
+    $stored_key = $wpdb->get_var($wpdb->prepare(
+        "SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s LIMIT 1",
+        $post_id,
+        SHARE_PREVIEWS_KEY_META
+    ));
 
     // Use hash_equals for timing-safe comparison
-    $is_valid = !empty($stored_key) && hash_equals($stored_key, $key);
-
-    // Track attempt
-    $attempts[] = time();
-    set_transient($rate_limit_key, $attempts, MINUTE_IN_SECONDS);
-
-    if (!$is_valid) {
-        share_previews_log_suspicious_activity('invalid_key', $post_id, $ip);
-    } else {
-        share_previews_log_preview_access($post_id, $ip);
-    }
+    $is_valid = !empty($stored_key) && strlen($stored_key) === 64 && hash_equals($stored_key, $key);
 
     return $is_valid;
 }
@@ -213,6 +263,31 @@ function share_previews_get_client_ip() {
  * Display preview URL meta box in the page editor.
  */
 add_action('add_meta_boxes', function () {
+    global $post;
+    
+    if (!$post) {
+        return;
+    }
+    
+    // Check if this post should have the meta box
+    $show_box = false;
+    
+    // Always show on drafts
+    if ($post->post_status === 'draft') {
+        $show_box = true;
+    } else {
+        // On published/other statuses, only show if staging mode is enabled
+        $allow_all_statuses = defined('SHARE_PREVIEWS_ALLOW_ALL_STATUSES') && SHARE_PREVIEWS_ALLOW_ALL_STATUSES;
+        if ($allow_all_statuses) {
+            $show_box = true;
+        }
+    }
+    
+    // Only add the meta box if the post is eligible
+    if (!$show_box) {
+        return;
+    }
+    
     add_meta_box(
         'share_previews_box',
         'Preview URL',
@@ -242,27 +317,23 @@ function share_previews_render_meta_box($post) {
         return;
     }
 
-    // Only show for draft posts
-    if ($post->post_status !== 'draft') {
-        echo '<p style="color: #666; margin: 0;"><em>This URL is only available for draft posts.</em></p>';
-        return;
-    }
+    $is_staging_mode = share_previews_is_staging_mode();
+    $has_key = get_post_meta($post->ID, SHARE_PREVIEWS_KEY_META, true);
 
-    // Check if a preview key already exists
-    $has_key = get_post_meta($post->ID, '_share_previews_key', true);
-
-    // Only generate preview URL if a key already exists (don't auto-generate during meta box render)
+    // Determine if we should show a preview URL
     $preview_url = '';
-    if ($has_key) {
-        $preview_url = share_previews_get_draft_preview_link($post->ID);
-        if (!$preview_url) {
-            echo '<p style="color: #999; margin: 0;"><em>Unable to generate preview URL.</em></p>';
-            return;
-        }
+    if ($is_staging_mode) {
+        // Staging mode: generate URL for published posts (no key generation)
+        $preview_url = share_previews_get_draft_preview_link($post->ID, false);
+    } elseif ($has_key) {
+        // Draft mode: only generate URL if key already exists (no auto-generation)
+        $preview_url = share_previews_get_draft_preview_link($post->ID, false);
     }
     
-    // Add nonce field for security
-    wp_nonce_field('share_previews_regen', 'share_previews_nonce');
+    // Add nonce fields for security (unique nonces for each action)
+    wp_nonce_field('share_previews_generate_nonce', 'share_previews_generate_nonce');
+    wp_nonce_field('share_previews_regenerate_nonce', 'share_previews_regenerate_nonce');
+    wp_nonce_field('share_previews_remove_nonce', 'share_previews_remove_nonce');
     ?>
     <style>
         #share_previews_box .inside {
@@ -337,32 +408,47 @@ function share_previews_render_meta_box($post) {
     </style>
 
     <div class="share-previews-url-wrapper">
-        <?php if ($has_key): ?>
+        <?php if ($preview_url): ?>
             <input type="text" class="share-previews-url" value="<?php echo esc_attr($preview_url); ?>" readonly>
             <button class="share-previews-copy-btn" type="button" onclick="share_previews_copy_url(this)">Copy</button>
-        <?php else: ?>
+        <?php elseif ($post->post_status === 'draft'): ?>
             <button class="share-previews-generate-btn" type="button" onclick="share_previews_generate_key(<?php echo esc_attr($post->ID); ?>)" style="padding: 8px 16px; background: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 600; width: 100%; transition: background 200ms ease-in-out; display: inline-block;">+ Generate Preview URL</button>
         <?php endif; ?>
     </div>
 
-    <div class="share-previews-info" <?php echo $has_key ? '' : 'style="display: none;"'; ?>>
-        📋 Share this URL to let others preview this draft page without logging in. The URL is only valid while the page remains in draft status.
+    <div class="share-previews-info" <?php echo $preview_url ? '' : 'style="display: none;"'; ?>>
+        <?php if ($allow_all_statuses && $post->post_status !== 'draft'): ?>
+            📋 Share this URL to let others preview this published page. Anyone with the URL can access it.
+        <?php else: ?>
+            📋 Share this URL to let others preview this draft page without logging in. The URL is only valid while the page remains in draft status.
+        <?php endif; ?>
     </div>
 
     <div class="share-previews-alert" style="display: none; margin-top: 12px; padding: 10px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px; color: #856404;">
-        <p style="margin: 0 0 10px 0; font-size: 13px;"><strong>⚠️ Regenerate URL?</strong></p>
-        <p style="margin: 0 0 10px 0; font-size: 13px;">This will invalidate the current preview URL. Anyone using the old URL won't be able to access this draft.</p>
-        <div style="display: flex; gap: 8px;">
-            <button class="share-previews-confirm-regen" type="button" onclick="share_previews_confirm_regenerate(<?php echo esc_attr($post->ID); ?>)" style="padding: 6px 12px; background: #000; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500;">Regenerate</button>
-            <button class="share-previews-cancel-regen" type="button" onclick="share_previews_cancel_regenerate()" style="padding: 6px 12px; background: #fff; color: #000; border: 1px solid #ddd; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500;">Cancel</button>
-        </div>
     </div>
 
-    <button class="share-previews-regen-btn" type="button" onclick="share_previews_show_regen_alert()" style="margin-top: 12px; padding: 6px 12px; background: #dc3545; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500; width: 100%; display: <?php echo $has_key ? 'block' : 'none'; ?>;">🔄 Regenerate URL</button>
+    <button class="share-previews-regen-btn" type="button" onclick="share_previews_show_regen_alert()" style="margin-top: 12px; padding: 6px 12px; background: #dc3545; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500; width: 100%; display: none;">🔄 Regenerate URL</button>
 
-    <a href="#" class="share-previews-remove-link" onclick="event.preventDefault(); share_previews_show_remove_alert()" style="display: <?php echo $has_key ? 'inline-block' : 'none'; ?>; margin-top: 8px; font-size: 12px; color: #666; text-decoration: none; padding: 4px 0; border-bottom: 1px dotted #999;">🗑️ Remove URL</a>
+    <a href="#" class="share-previews-remove-link" onclick="event.preventDefault(); share_previews_show_remove_alert()" style="margin-top: 8px; font-size: 12px; color: #666; text-decoration: none; padding: 4px 0; border-bottom: 1px dotted #999; display: none;">🗑️ Remove URL</a>
 
     <script>
+        function share_previews_update_button_visibility() {
+            const previewUrl = document.querySelector('.share-previews-url');
+            const regenBtn = document.querySelector('.share-previews-regen-btn');
+            const removeLink = document.querySelector('.share-previews-remove-link');
+            const postStatus = '<?php echo esc_js($post->post_status); ?>';
+            
+            if (previewUrl && previewUrl.value.trim() && postStatus === 'draft') {
+                // URL exists AND post is draft, show regenerate and remove buttons
+                if (regenBtn) regenBtn.style.display = 'block';
+                if (removeLink) removeLink.style.display = 'inline-block';
+            } else {
+                // No URL or post is not draft, hide regenerate and remove buttons
+                if (regenBtn) regenBtn.style.display = 'none';
+                if (removeLink) removeLink.style.display = 'none';
+            }
+        }
+
         function share_previews_apply_button_styles() {
             const buttons = document.querySelectorAll('.share-previews-confirm-regen, .share-previews-confirm-remove, .share-previews-cancel-regen, .share-previews-cancel-remove');
             buttons.forEach(btn => {
@@ -378,6 +464,12 @@ function share_previews_render_meta_box($post) {
                 });
             });
         }
+
+        // Initialize button visibility on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            share_previews_update_button_visibility();
+            share_previews_apply_button_styles();
+        });
 
         function share_previews_copy_url(button) {
             const input = button.previousElementSibling;
@@ -396,7 +488,15 @@ function share_previews_render_meta_box($post) {
         }
 
         function share_previews_show_regen_alert() {
-            document.querySelector('.share-previews-alert').style.display = 'block';
+            const alertBox = document.querySelector('.share-previews-alert');
+            const postId = document.querySelector('input[name="post_ID"]').value;
+            
+            // Set up the regenerate confirmation alert
+            alertBox.innerHTML = '<p style="margin: 0 0 10px 0; font-size: 13px;"><strong>⚠️ Regenerate URL?</strong></p><p style="margin: 0 0 10px 0; font-size: 13px;">This will invalidate the current preview URL. Anyone using the old URL won\'t be able to access this draft.</p><div style="display: flex; gap: 8px;"><button class="share-previews-confirm-regen" type="button" data-post-id="' + postId + '" onclick="share_previews_confirm_regenerate(this)" style="padding: 6px 12px; background: #000; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500;">Regenerate</button><button class="share-previews-cancel-regen" type="button" onclick="share_previews_cancel_regenerate()" style="padding: 6px 12px; background: #fff; color: #000; border: 1px solid #ddd; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500;">Cancel</button></div>';
+            alertBox.style.background = '#fff3cd';
+            alertBox.style.borderColor = '#ffc107';
+            alertBox.style.color = '#856404';
+            alertBox.style.display = 'block';
             document.querySelector('.share-previews-regen-btn').style.display = 'none';
             share_previews_apply_button_styles();
         }
@@ -408,6 +508,13 @@ function share_previews_render_meta_box($post) {
 
         function share_previews_generate_key(postId) {
             const button = document.querySelector('.share-previews-generate-btn');
+            const nonceField = document.querySelector('input[name="share_previews_generate_nonce"]');
+            
+            if (!nonceField) {
+                alert('Security field missing');
+                return;
+            }
+            
             button.disabled = true;
             button.textContent = '⏳ Generating...';
 
@@ -416,11 +523,7 @@ function share_previews_render_meta_box($post) {
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
                 },
-                body: new URLSearchParams({
-                    action: 'share_previews_generate_key',
-                    post_id: postId,
-                    nonce: '<?php echo wp_create_nonce('share_previews_regen'); ?>'
-                })
+                body: 'action=share_previews_generate_key&post_id=' + encodeURIComponent(postId) + '&nonce=' + encodeURIComponent(nonceField.value)
             })
             .then(response => response.json())
             .then(data => {
@@ -429,10 +532,11 @@ function share_previews_render_meta_box($post) {
                     const wrapper = document.querySelector('.share-previews-url-wrapper');
                     wrapper.innerHTML = '<input type="text" class="share-previews-url" value="' + data.data.preview_url.replace(/"/g, '&quot;') + '" readonly><button class="share-previews-copy-btn" type="button" onclick="share_previews_copy_url(this)">Copy</button>';
                     
-                    // Show the info and regenerate button
+                    // Show the info
                     document.querySelector('.share-previews-info').style.display = 'block';
-                    document.querySelector('.share-previews-regen-btn').style.display = 'block';
-                    document.querySelector('.share-previews-remove-link').style.display = 'inline-block';
+                    
+                    // Update button visibility based on URL presence
+                    share_previews_update_button_visibility();
                     
                     // Auto-copy the URL
                     const urlInput = document.querySelector('.share-previews-url');
@@ -459,7 +563,8 @@ function share_previews_render_meta_box($post) {
 
         function share_previews_show_remove_alert() {
             const alertBox = document.querySelector('.share-previews-alert');
-            alertBox.innerHTML = '<p style="margin: 0 0 10px 0; font-size: 13px;"><strong>⚠️ Remove URL?</strong></p><p style="margin: 0 0 10px 0; font-size: 13px;">This will remove the preview URL. Anyone with the URL won\'t be able to access this draft anymore.</p><div style="display: flex; gap: 8px;"><button class="share-previews-confirm-remove" type="button" onclick="share_previews_confirm_remove(<?php echo esc_attr($post->ID); ?>)" style="padding: 6px 12px; background: #000; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500;">Remove</button><button class="share-previews-cancel-remove" type="button" onclick="share_previews_cancel_remove()" style="padding: 6px 12px; background: #fff; color: #000; border: 1px solid #ddd; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500;">Cancel</button></div>';
+            const postId = document.querySelector('input[name="post_ID"]').value;
+            alertBox.innerHTML = '<p style="margin: 0 0 10px 0; font-size: 13px;"><strong>⚠️ Remove URL?</strong></p><p style="margin: 0 0 10px 0; font-size: 13px;">This will remove the preview URL. Anyone with the URL won\'t be able to access this draft anymore.</p><div style="display: flex; gap: 8px;"><button class="share-previews-confirm-remove" type="button" data-post-id="' + postId + '" onclick="share_previews_confirm_remove(this)" style="padding: 6px 12px; background: #000; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500;">Remove</button><button class="share-previews-cancel-remove" type="button" onclick="share_previews_cancel_remove()" style="padding: 6px 12px; background: #fff; color: #000; border: 1px solid #ddd; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500;">Cancel</button></div>';
             alertBox.style.background = '#f8d7da';
             alertBox.style.borderColor = '#f5c6cb';
             alertBox.style.color = '#721c24';
@@ -473,9 +578,17 @@ function share_previews_render_meta_box($post) {
             document.querySelector('.share-previews-regen-btn').style.display = 'block';
         }
 
-        function share_previews_confirm_remove(postId) {
+        function share_previews_confirm_remove(button) {
+            const postId = button.getAttribute('data-post-id');
             const alertBox = document.querySelector('.share-previews-alert');
-            const button = document.querySelector('.share-previews-confirm-remove');
+            const nonceField = document.querySelector('input[name="share_previews_remove_nonce"]');
+            
+            if (!nonceField) {
+                console.error('Nonce field not found');
+                alertBox.innerHTML = '<p style="margin: 0; font-size: 13px; color: #721c24;"><strong>❌ Error:</strong> Security field missing</p>';
+                return;
+            }
+            
             button.disabled = true;
             button.textContent = '⏳ Removing...';
 
@@ -484,23 +597,21 @@ function share_previews_render_meta_box($post) {
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
                 },
-                body: new URLSearchParams({
-                    action: 'share_previews_remove_key',
-                    post_id: postId,
-                    nonce: '<?php echo wp_create_nonce('share_previews_regen'); ?>'
-                })
+                body: 'action=share_previews_remove_key&post_id=' + encodeURIComponent(postId) + '&nonce=' + encodeURIComponent(nonceField.value)
             })
             .then(response => response.json())
             .then(data => {
+                console.log('Remove response:', data);
                 if (data.success) {
                     // Replace URL and buttons with generate button
                     const wrapper = document.querySelector('.share-previews-url-wrapper');
                     wrapper.innerHTML = '<button class="share-previews-generate-btn" type="button" onclick="share_previews_generate_key(' + postId + ')" style="padding: 8px 16px; background: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 600; width: 100%; transition: background 0.2s;">+ Generate Preview URL</button>';
                     
-                    // Hide the info and regenerate button
+                    // Hide the info
                     document.querySelector('.share-previews-info').style.display = 'none';
-                    document.querySelector('.share-previews-regen-btn').style.display = 'none';
-                    document.querySelector('.share-previews-remove-link').style.display = 'none';
+                    
+                    // Update button visibility (will hide regenerate/remove since no URL)
+                    share_previews_update_button_visibility();
                     
                     // Show success message
                     alertBox.innerHTML = '<p style="margin: 0; font-size: 13px;"><strong>✅ URL removed!</strong> Preview is no longer active.</p>';
@@ -510,14 +621,9 @@ function share_previews_render_meta_box($post) {
                     
                     setTimeout(() => {
                         document.querySelector('.share-previews-alert').style.display = 'none';
-                        const regenBtn = document.querySelector('.share-previews-regen-btn');
-                        if (regenBtn) {
-                            regenBtn.style.display = 'none';
-                        }
                     }, 2000);
                 } else {
-                    alertBox.innerHTML = '<p style="margin: 0; font-size: 13px; color: #721c24;"><strong>❌ Error:</strong> </p>';
-                    alertBox.querySelector('p').textContent = alertBox.querySelector('p').textContent + (data.data ? data.data.substring(0, 100) : 'Unable to remove URL');
+                    alertBox.innerHTML = '<p style="margin: 0; font-size: 13px; color: #721c24;"><strong>❌ Error:</strong> ' + (data.data ? data.data.substring(0, 100) : 'Unable to remove URL') + '</p>';
                     button.disabled = false;
                     button.textContent = 'Remove';
                 }
@@ -530,9 +636,17 @@ function share_previews_render_meta_box($post) {
             });
         }
 
-        function share_previews_confirm_regenerate(postId) {
+        function share_previews_confirm_regenerate(button) {
+            const postId = button.getAttribute('data-post-id');
             const alertBox = document.querySelector('.share-previews-alert');
-            const button = document.querySelector('.share-previews-confirm-regen');
+            const nonceField = document.querySelector('input[name="share_previews_regenerate_nonce"]');
+            
+            if (!nonceField) {
+                console.error('Nonce field not found');
+                alertBox.innerHTML = '<p style="margin: 0; font-size: 13px; color: #721c24;"><strong>❌ Error:</strong> Security field missing</p>';
+                return;
+            }
+            
             button.disabled = true;
             button.textContent = '⏳ Regenerating...';
 
@@ -541,11 +655,7 @@ function share_previews_render_meta_box($post) {
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded',
                 },
-                body: new URLSearchParams({
-                    action: 'share_previews_regenerate',
-                    post_id: postId,
-                    nonce: '<?php echo wp_create_nonce('share_previews_regen'); ?>'
-                })
+                body: 'action=share_previews_regenerate&post_id=' + encodeURIComponent(postId) + '&nonce=' + encodeURIComponent(nonceField.value)
             })
             .then(response => response.json())
             .then(data => {
@@ -558,6 +668,9 @@ function share_previews_render_meta_box($post) {
                         document.execCommand('copy');
                     }
                     
+                    // Update button visibility (keeps regenerate/remove visible)
+                    share_previews_update_button_visibility();
+                    
                     // Show success message
                     alertBox.innerHTML = '<p style="margin: 0; font-size: 13px;"><strong>✅ URL regenerated!</strong> New URL copied to clipboard.</p>';
                     alertBox.style.background = '#d4edda';
@@ -569,8 +682,7 @@ function share_previews_render_meta_box($post) {
                         document.querySelector('.share-previews-regen-btn').style.display = 'block';
                     }, 2000);
                 } else {
-                    alertBox.innerHTML = '<p style="margin: 0; font-size: 13px; color: #721c24;"><strong>❌ Error:</strong> </p>';
-                    alertBox.querySelector('p').textContent = alertBox.querySelector('p').textContent + (data.data ? data.data.substring(0, 100) : 'Unable to regenerate URL');
+                    alertBox.innerHTML = '<p style="margin: 0; font-size: 13px; color: #721c24;"><strong>❌ Error:</strong> ' + (data.data ? data.data.substring(0, 100) : 'Unable to regenerate URL') + '</p>';
                     alertBox.style.background = '#f8d7da';
                     alertBox.style.borderColor = '#f5c6cb';
                     button.disabled = false;
@@ -594,7 +706,12 @@ function share_previews_render_meta_box($post) {
  * Allow draft posts to be viewed when a valid preview key is provided.
  */
 add_action('pre_get_posts', function ($query) {
-    if (is_admin() || !$query->is_main_query()) {
+    // Don't run on backend
+    if (defined('WP_ADMIN') && WP_ADMIN) {
+        return;
+    }
+    
+    if (!$query->is_main_query()) {
         return;
     }
 
@@ -608,7 +725,15 @@ add_action('pre_get_posts', function ($query) {
  * Bypass the "post_status must be published" check in WordPress.
  */
 add_filter('posts_pre_query', function ($posts, $query) {
-    if (is_admin() || !$query->is_main_query()) {
+    // Don't run on backend
+    if (defined('WP_ADMIN') && WP_ADMIN) {
+        return $posts;
+    }
+
+    // For preview URLs, check if this is a single post query
+    $is_single_post_query = !empty($query->query_vars['p']) || !empty($query->query_vars['name']);
+    
+    if (!$is_single_post_query) {
         return $posts;
     }
 
@@ -616,6 +741,7 @@ add_filter('posts_pre_query', function ($posts, $query) {
         $post_id = intval($_GET['p']);
         $post = get_post($post_id);
 
+        // Ensure post is a draft
         if ($post && $post->post_status === 'draft') {
             // Verify via filter that this post can be previewed
             if (apply_filters('share_previews_allow_preview', true, $post_id, $post)) {
@@ -632,28 +758,44 @@ add_filter('posts_pre_query', function ($posts, $query) {
  * AJAX handler to regenerate preview key.
  */
 add_action('wp_ajax_share_previews_regenerate', function () {
-    // Verify nonce
-    if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'share_previews_regen')) {
-        wp_send_json_error('Invalid nonce');
+    // Verify nonce (use unique action name for this specific AJAX handler)
+    if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'share_previews_regenerate_nonce')) {
+        wp_send_json_error('Invalid request');
+        return;
     }
 
     // Sanitize and validate post_id
-    $post_id = isset($_POST['post_id']) ? (int) sanitize_text_field($_POST['post_id']) : 0;
+    $post_id = isset($_POST['post_id']) ? (int) $_POST['post_id'] : 0;
+    
+    if ($post_id <= 0) {
+        wp_send_json_error('Invalid post ID');
+        return;
+    }
+
+    $post = get_post($post_id);
     
     // Verify permissions
-    if (!current_user_can('edit_post', $post_id)) {
+    if (!$post || !current_user_can('edit_post', $post_id)) {
         wp_send_json_error('Insufficient permissions');
-    }
-    $post = get_post($post_id);
-
-    // Verify post exists and is a draft
-    if (!$post || $post->post_status !== 'draft') {
-        wp_send_json_error('Post is not a draft');
+        return;
     }
 
-    // Regenerate the key
+    // Regenerate is only allowed on drafts (in all modes)
+    if ($post->post_status !== 'draft') {
+        wp_send_json_error('Post status not eligible for preview');
+        return;
+    }
+
+    // Regenerate the key (drafts always use keys)
     $new_key = share_previews_regenerate_preview_key($post_id);
-    $preview_url = share_previews_get_draft_preview_link($post_id);
+    
+    // Build the preview URL using the key we just generated
+    $base_url = share_previews_get_base_url();
+    $preview_url = add_query_arg([
+        'p' => $post_id,
+        'preview' => '1',
+        'key' => $new_key,
+    ], $base_url);
 
     wp_send_json_success([
         'key' => $new_key,
@@ -665,37 +807,78 @@ add_action('wp_ajax_share_previews_regenerate', function () {
  * AJAX handler to generate new preview key (for posts without an existing key).
  */
 add_action('wp_ajax_share_previews_generate_key', function () {
-    // Verify nonce
-    if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'share_previews_regen')) {
-        wp_send_json_error('Invalid nonce');
+    // Verify nonce (use unique action name for this specific AJAX handler)
+    if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'share_previews_generate_nonce')) {
+        wp_send_json_error('Invalid request');
+        return;
     }
 
     // Sanitize and validate post_id
-    $post_id = isset($_POST['post_id']) ? (int) sanitize_text_field($_POST['post_id']) : 0;
+    $post_id = isset($_POST['post_id']) ? (int) $_POST['post_id'] : 0;
+    
+    if ($post_id <= 0) {
+        wp_send_json_error('Invalid post ID');
+        return;
+    }
+
+    $post = get_post($post_id);
     
     // Verify permissions
-    if (!current_user_can('edit_post', $post_id)) {
+    if (!$post || !current_user_can('edit_post', $post_id)) {
         wp_send_json_error('Insufficient permissions');
-    }
-    $post = get_post($post_id);
-
-    // Verify post exists and is a draft
-    if (!$post || $post->post_status !== 'draft') {
-        wp_send_json_error('Post is not a draft');
+        return;
     }
 
-    // Check if key already exists
-    $existing_key = get_post_meta($post_id, '_share_previews_key', true);
-    if ($existing_key) {
-        wp_send_json_error('Key already exists');
+    // Verify post exists and is a draft (only draft mode supports key generation)
+    if ($post->post_status !== 'draft') {
+        wp_send_json_error('Post must be a draft');
+        return;
+    }
+
+    // Check if key already exists (prevent race condition by verifying again before updating)
+    $existing_key = get_post_meta($post_id, SHARE_PREVIEWS_KEY_META, true);
+    if (!empty($existing_key)) {
+        wp_send_json_error('Preview URL already exists');
+        return;
     }
 
     // Generate the key directly (don't use get_preview_key as it auto-generates)
     $new_key = bin2hex(random_bytes(32));
-    update_post_meta($post_id, '_share_previews_key', $new_key);
+    
+    // Use add_post_meta with unique=true to prevent race conditions
+    $add_result = add_post_meta($post_id, SHARE_PREVIEWS_KEY_META, $new_key, true);
+    if (!$add_result) {
+        wp_send_json_error('Unable to create preview URL');
+        return;
+    }
+
+    // Clear the post meta cache to ensure immediate retrieval
+    wp_cache_delete($post_id, 'post_meta');
+    clean_post_cache($post_id);
+    
+    // Verify the key was actually saved by checking immediately
+    global $wpdb;
+    $verify_key = $wpdb->get_var($wpdb->prepare(
+        "SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s LIMIT 1",
+        $post_id,
+        SHARE_PREVIEWS_KEY_META
+    ));
+    
+    // If verification fails, don't send the URL
+    if ($verify_key !== $new_key) {
+        wp_send_json_error('Unable to verify preview URL was saved. Saved: ' . ($verify_key ? substr($verify_key, 0, 8) . '...' : 'NULL') . ', Expected: ' . substr($new_key, 0, 8) . '...');
+        return;
+    }
+
     share_previews_log_suspicious_activity('generate_key', $post_id, 'admin');
     
-    $preview_url = share_previews_get_draft_preview_link($post_id);
+    // Build the preview URL using the key we just added (avoid retrieval timing issues)
+    $base_url = share_previews_get_base_url();
+    $preview_url = add_query_arg([
+        'p' => $post_id,
+        'preview' => '1',
+        'key' => $new_key,
+    ], $base_url);
 
     wp_send_json_success([
         'key' => $new_key,
@@ -707,30 +890,39 @@ add_action('wp_ajax_share_previews_generate_key', function () {
  * AJAX handler to remove preview key for a draft post.
  */
 add_action('wp_ajax_share_previews_remove_key', function () {
-    // Verify nonce
-    if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'share_previews_regen')) {
-        wp_send_json_error('Invalid nonce');
+    // Verify nonce (use unique action name for this specific AJAX handler)
+    if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'share_previews_remove_nonce')) {
+        wp_send_json_error('Invalid request');
+        return;
     }
 
     // Sanitize and validate post_id
-    $post_id = isset($_POST['post_id']) ? (int) sanitize_text_field($_POST['post_id']) : 0;
+    $post_id = isset($_POST['post_id']) ? (int) $_POST['post_id'] : 0;
+    
+    if ($post_id <= 0) {
+        wp_send_json_error('Invalid post ID');
+        return;
+    }
+
+    $post = get_post($post_id);
     
     // Verify permissions
-    if (!current_user_can('edit_post', $post_id)) {
+    if (!$post || !current_user_can('edit_post', $post_id)) {
         wp_send_json_error('Insufficient permissions');
+        return;
     }
-    $post = get_post($post_id);
 
-    // Verify post exists and is a draft
-    if (!$post || $post->post_status !== 'draft') {
-        wp_send_json_error('Post is not a draft');
+    // Verify post exists and is a draft (only draft mode has keys to remove)
+    if ($post->post_status !== 'draft') {
+        wp_send_json_error('Post must be a draft');
+        return;
     }
 
     // Delete the key from post meta
-    delete_post_meta($post_id, '_share_previews_key');
+    delete_post_meta($post_id, SHARE_PREVIEWS_KEY_META);
 
     wp_send_json_success([
-        'message' => 'Key removed successfully',
+        'message' => 'Preview URL removed',
     ]);
 });
 
@@ -756,15 +948,29 @@ function share_previews_render_admin_page() {
         wp_die('Unauthorized');
     }
 
+    // Verify nonce for form submission
+    if (!empty($_GET['s']) || !empty($_GET['post_type'])) {
+        if (!isset($_GET['share_previews_filter_nonce']) || 
+            !wp_verify_nonce($_GET['share_previews_filter_nonce'], 'share_previews_filter')) {
+            wp_die('Security check failed');
+        }
+    }
+
     // Get search/filter parameters
     $search = isset($_GET['s']) ? sanitize_text_field($_GET['s']) : '';
     $post_type = isset($_GET['post_type']) ? sanitize_text_field($_GET['post_type']) : '';
     $paged = isset($_GET['paged']) ? max(1, intval($_GET['paged'])) : 1;
     $per_page = 20;
 
+    // Validate post_type against allowed post types
+    $allowed_post_types = ['post', 'page'];
+    if (!empty($post_type) && !in_array($post_type, $allowed_post_types, true)) {
+        $post_type = '';
+    }
+
     // Query posts with preview keys
     $args = [
-        'post_type' => ['post', 'page'],
+        'post_type' => $allowed_post_types,
         'posts_per_page' => $per_page,
         'paged' => $paged,
         'meta_key' => '_share_previews_key',
@@ -788,11 +994,14 @@ function share_previews_render_admin_page() {
     ?>
     <div class="wrap">
         <h1>Share Previews Manager</h1>
+        <?php wp_nonce_field('share_previews_regenerate_nonce', 'share_previews_regenerate_nonce_admin'); ?>
+        <?php wp_nonce_field('share_previews_remove_nonce', 'share_previews_remove_nonce_admin'); ?>
         <p>Manage all active preview URLs for draft posts and pages.</p>
 
         <!-- Search and Filter -->
         <form method="get" class="share-previews-search-form">
             <input type="hidden" name="page" value="share-previews-manager">
+            <?php wp_nonce_field('share_previews_filter', 'share_previews_filter_nonce'); ?>
             <input 
                 type="text" 
                 name="s" 
@@ -860,6 +1069,7 @@ function share_previews_render_admin_page() {
                 display: flex;
                 gap: 8px;
                 flex-wrap: wrap;
+                justify-content: flex-end;
             }
 
             .share-previews-btn {
@@ -957,7 +1167,7 @@ function share_previews_render_admin_page() {
                         <th style="width: 25%;">Post</th>
                         <th style="width: 40%;">Preview URL</th>
                         <th style="width: 15%;">Created</th>
-                        <th style="width: 20%;">Actions</th>
+                        <th style="width: 20%; text-align: right;">Actions</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -994,7 +1204,8 @@ function share_previews_render_admin_page() {
                                     <?php if ($preview_url) : ?>
                                         <button 
                                             class="share-previews-btn share-previews-btn-copy" 
-                                            onclick="share_previews_copy_admin_url('<?php echo esc_attr($preview_url); ?>', this)"
+                                            data-url="<?php echo esc_attr($preview_url); ?>"
+                                            onclick="share_previews_copy_admin_url(this)"
                                         >
                                             📋 Copy
                                         </button>
@@ -1007,13 +1218,16 @@ function share_previews_render_admin_page() {
                                         </a>
                                         <button 
                                             class="share-previews-btn share-previews-btn-regen" 
-                                            onclick="share_previews_admin_regenerate(<?php echo $post_id; ?>, this)"
+                                            data-post-id="<?php echo esc_attr($post_id); ?>"
+                                            onclick="share_previews_admin_regenerate(this)"
                                         >
                                             🔄 Regen
                                         </button>
                                         <button 
                                             class="share-previews-btn share-previews-btn-delete" 
-                                            onclick="share_previews_admin_delete(<?php echo $post_id; ?>, '<?php echo esc_attr(get_the_title()); ?>', this)"
+                                            data-post-id="<?php echo esc_attr($post_id); ?>"
+                                            data-post-title="<?php echo esc_attr(get_the_title()); ?>"
+                                            onclick="share_previews_admin_delete(this)"
                                         >
                                             🗑️ Delete
                                         </button>
@@ -1053,7 +1267,8 @@ function share_previews_render_admin_page() {
     </div>
 
     <script>
-        function share_previews_copy_admin_url(url, button) {
+        function share_previews_copy_admin_url(button) {
+            const url = button.getAttribute('data-url');
             const textarea = document.createElement('textarea');
             textarea.value = url;
             document.body.appendChild(textarea);
@@ -1071,7 +1286,8 @@ function share_previews_render_admin_page() {
             }, 2000);
         }
 
-        function share_previews_admin_regenerate(postId, button) {
+        function share_previews_admin_regenerate(button) {
+            const postId = button.getAttribute('data-post-id');
             if (!confirm('Regenerate preview URL? The old URL will no longer work.')) {
                 return;
             }
@@ -1087,7 +1303,7 @@ function share_previews_render_admin_page() {
                 body: new URLSearchParams({
                     action: 'share_previews_regenerate',
                     post_id: postId,
-                    nonce: '<?php echo wp_create_nonce('share_previews_regen'); ?>'
+                    nonce: document.querySelector('input[name="share_previews_regenerate_nonce_admin"]').value
                 })
             })
             .then(response => response.json())
@@ -1108,7 +1324,10 @@ function share_previews_render_admin_page() {
             });
         }
 
-        function share_previews_admin_delete(postId, postTitle, button) {
+        function share_previews_admin_delete(button) {
+            const postId = button.getAttribute('data-post-id');
+            const postTitle = button.getAttribute('data-post-title');
+            
             if (!confirm('Delete preview URL for "' + postTitle + '"?\n\nThis cannot be undone.')) {
                 return;
             }
@@ -1124,7 +1343,7 @@ function share_previews_render_admin_page() {
                 body: new URLSearchParams({
                     action: 'share_previews_remove_key',
                     post_id: postId,
-                    nonce: '<?php echo wp_create_nonce('share_previews_regen'); ?>'
+                    nonce: document.querySelector('input[name="share_previews_remove_nonce_admin"]').value
                 })
             })
             .then(response => response.json())
